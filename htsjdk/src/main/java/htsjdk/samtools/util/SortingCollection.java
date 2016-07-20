@@ -30,6 +30,7 @@ import java.lang.reflect.Array;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Collection to which many records can be added.  After all records are added, the collection can be
@@ -103,9 +104,9 @@ public class SortingCollection<T> implements Iterable<T> {
     private T[] ramRecords, ramRecordsOne, ramRecordsTwo;
     private boolean iterationStarted = false;
     private boolean doneAdding = false;
-    private volatile boolean ramRecordsOneIsActive = true;
-    private volatile boolean ramRecordsTwoIsActive = false;
-    private short isWrite = 0;
+    private AtomicBoolean ramRecordsOneIsActive = new AtomicBoolean(true);
+    private AtomicBoolean ramRecordsTwoIsActive = new AtomicBoolean(false);
+    private AtomicBoolean isWriteRamRecordsOne = new AtomicBoolean(true);
     private ExecutorService service = Executors.newSingleThreadExecutor();
 
     /**
@@ -185,6 +186,9 @@ public class SortingCollection<T> implements Iterable<T> {
             spillToDisk();
         }
 
+        service.shutdown();
+        while (!service.isTerminated()){}
+
         // Facilitate GC
         this.ramRecords = null;
     }
@@ -214,12 +218,12 @@ public class SortingCollection<T> implements Iterable<T> {
 
             private int numRecordsInRam;
             private T[] ramRecords;
-            short part;
+            private boolean isOnePart;
 
-            Task(int numRcordsInRam, T[] ramRecords, short part){
+            Task(int numRcordsInRam, T[] ramRecords, boolean isOnePart){
                 this.numRecordsInRam = numRcordsInRam;
                 this.ramRecords = ramRecords;
-                this.part = part;
+                this.isOnePart = isOnePart;
             }
 
             @Override
@@ -254,10 +258,10 @@ public class SortingCollection<T> implements Iterable<T> {
                     throw new RuntimeIOException(e);
                 }
 
-                if (part == 0) {
-                    ramRecordsOneIsActive = false;
+                if (isOnePart) {
+                    ramRecordsOneIsActive.set(false);
                 } else{
-                    ramRecordsTwoIsActive = false;
+                    ramRecordsTwoIsActive.set(false);
                 }
 
 
@@ -265,20 +269,20 @@ public class SortingCollection<T> implements Iterable<T> {
             }
         }
 
-        if (isWrite == 0) {
-            Runnable task = new Task(numRecordsInRam, ramRecordsOne, isWrite);
+        if (isWriteRamRecordsOne.get()) {
+            Runnable task = new Task(numRecordsInRam, ramRecordsOne, true);
             service.submit(task);
-            while (ramRecordsTwoIsActive){}
-            ramRecordsTwoIsActive = true;
+            while (ramRecordsTwoIsActive.get()){}
+            ramRecordsTwoIsActive.set(true);
             ramRecords = ramRecordsTwo;
-            isWrite = 1;
+            isWriteRamRecordsOne.set(false);
         } else {
-            Runnable task = new Task(numRecordsInRam, ramRecordsTwo, isWrite);
+            Runnable task = new Task(numRecordsInRam, ramRecordsTwo, false);
             service.submit(task);
-            while (ramRecordsOneIsActive) {}
-            ramRecordsOneIsActive = true;
+            while (ramRecordsOneIsActive.get()) {}
+            ramRecordsOneIsActive.set(true);
             ramRecords = ramRecordsOne;
-            isWrite = 0;
+            isWriteRamRecordsOne.set(true);
         }
         numRecordsInRam = 0;
 
