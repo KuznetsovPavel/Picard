@@ -30,7 +30,6 @@ import java.lang.reflect.Array;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Collection to which many records can be added.  After all records are added, the collection can be
@@ -104,9 +103,9 @@ public class SortingCollection<T> implements Iterable<T> {
     private T[] ramRecords, ramRecordsOne, ramRecordsTwo;
     private boolean iterationStarted = false;
     private boolean doneAdding = false;
-    private AtomicBoolean ramRecordsOneIsActive = new AtomicBoolean(true);
-    private AtomicBoolean ramRecordsTwoIsActive = new AtomicBoolean(false);
-    private AtomicBoolean isWriteRamRecordsOne = new AtomicBoolean(true);
+    private volatile boolean ramRecordsOneIsActive = true;
+    private volatile boolean ramRecordsTwoIsActive = false;
+    private volatile boolean isWriteRamRecordsOne = true;
     private ExecutorService service = Executors.newSingleThreadExecutor();
 
     /**
@@ -212,80 +211,77 @@ public class SortingCollection<T> implements Iterable<T> {
     /**
      * Sort the records in memory, write them to a file, and clear the buffer of records in memory.
      */
-    private void spillToDisk() {
 
-        class Task implements Runnable{
+    class SortAndWrite implements Runnable{
 
-            private int numRecordsInRam;
-            private T[] ramRecords;
-            private boolean isOnePart;
+        private int numRecordsInRam;
+        private T[] ramRecords;
+        private boolean isOnePart;
 
-            Task(int numRcordsInRam, T[] ramRecords, boolean isOnePart){
-                this.numRecordsInRam = numRcordsInRam;
-                this.ramRecords = ramRecords;
-                this.isOnePart = isOnePart;
-            }
+        SortAndWrite(int numRcordsInRam, T[] ramRecords, boolean isOnePart){
+            this.numRecordsInRam = numRcordsInRam;
+            this.ramRecords = ramRecords;
+            this.isOnePart = isOnePart;
+        }
 
-            @Override
-            public void run() {
+        @Override
+        public void run() {
+            try {
+                Arrays.sort(ramRecords, 0, numRecordsInRam, comparator);
+                final File f = newTempFile();
+                OutputStream os = null;
                 try {
-                    Arrays.sort(ramRecords, 0, numRecordsInRam, comparator);
-                    final File f = newTempFile();
-                    OutputStream os = null;
-                    try {
-                        os = tempStreamFactory.wrapTempOutputStream(new FileOutputStream(f), Defaults.BUFFER_SIZE);
-                        codec.setOutputStream(os);
-                        for (int i = 0; i < numRecordsInRam; ++i) {
-                            codec.encode(ramRecords[i]);
-                            // Facilitate GC
-                           ramRecords[i] = null;
-                        }
-
-                        os.flush();
-                    } catch (RuntimeIOException ex) {
-                        throw new RuntimeIOException("Problem writing temporary file " + f.getAbsolutePath() +
-                                ".  Try setting TMP_DIR to a file system with lots of space.", ex);
-                    } finally {
-                        if (os != null) {
-                            os.close();
-                        }
+                    os = tempStreamFactory.wrapTempOutputStream(new FileOutputStream(f), Defaults.BUFFER_SIZE);
+                    codec.setOutputStream(os);
+                    for (int i = 0; i < numRecordsInRam; ++i) {
+                        codec.encode(ramRecords[i]);
+                        // Facilitate GC
+                       ramRecords[i] = null;
                     }
 
-                    files.add(f);
-
-                }
-                catch (IOException e) {
-                    throw new RuntimeIOException(e);
-                }
-
-                if (isOnePart) {
-                    ramRecordsOneIsActive.set(false);
-                } else{
-                    ramRecordsTwoIsActive.set(false);
+                    os.flush();
+                } catch (RuntimeIOException ex) {
+                    throw new RuntimeIOException("Problem writing temporary file " + f.getAbsolutePath() +
+                            ".  Try setting TMP_DIR to a file system with lots of space.", ex);
+                } finally {
+                    if (os != null) {
+                        os.close();
+                    }
                 }
 
-
+                files.add(f);
 
             }
-        }
+            catch (IOException e) {
+                throw new RuntimeIOException(e);
+            }
 
-        if (isWriteRamRecordsOne.get()) {
-            Runnable task = new Task(numRecordsInRam, ramRecordsOne, true);
-            service.submit(task);
-            while (ramRecordsTwoIsActive.get()){}
-            ramRecordsTwoIsActive.set(true);
+            if (isOnePart) {
+                ramRecordsOneIsActive = false;
+            } else{
+                ramRecordsTwoIsActive = false;
+            }
+        }
+    }
+
+
+    private void spillToDisk() {
+        if (isWriteRamRecordsOne) {
+            Runnable task = new SortAndWrite(numRecordsInRam, ramRecordsOne, true);
+            service.execute(task);
+            while (ramRecordsTwoIsActive){}
+            ramRecordsTwoIsActive = true;
             ramRecords = ramRecordsTwo;
-            isWriteRamRecordsOne.set(false);
+            isWriteRamRecordsOne = false;
         } else {
-            Runnable task = new Task(numRecordsInRam, ramRecordsTwo, false);
-            service.submit(task);
-            while (ramRecordsOneIsActive.get()) {}
-            ramRecordsOneIsActive.set(true);
+            Runnable task = new SortAndWrite(numRecordsInRam, ramRecordsTwo, false);
+            service.execute(task);
+            while (ramRecordsOneIsActive) {}
+            ramRecordsOneIsActive = true;
             ramRecords = ramRecordsOne;
-            isWriteRamRecordsOne.set(true);
+            isWriteRamRecordsOne = true;
         }
         numRecordsInRam = 0;
-
     }
 
     /**
