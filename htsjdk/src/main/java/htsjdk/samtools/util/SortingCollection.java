@@ -25,23 +25,11 @@ package htsjdk.samtools.util;
 
 import htsjdk.samtools.Defaults;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.Serializable;
+import java.io.*;
 import java.lang.reflect.Array;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.Iterator;
-import java.util.List;
-import java.util.NoSuchElementException;
-import java.util.TreeSet;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Collection to which many records can be added.  After all records are added, the collection can be
@@ -112,9 +100,13 @@ public class SortingCollection<T> implements Iterable<T> {
     private final Comparator<T> comparator;
     private final int maxRecordsInRam;
     private int numRecordsInRam = 0;
-    private T[] ramRecords;
+    private T[] ramRecords, ramRecordsOne, ramRecordsTwo;
     private boolean iterationStarted = false;
     private boolean doneAdding = false;
+    private volatile boolean ramRecordsOneIsActive = true;
+    private volatile boolean ramRecordsTwoIsActive = false;
+    private volatile boolean isWriteRamRecordsOne = true;
+    private ExecutorService service = Executors.newSingleThreadExecutor();
 
     /**
      * Set to true when all temp files have been cleaned up
@@ -151,8 +143,10 @@ public class SortingCollection<T> implements Iterable<T> {
         this.tmpDirs = tmpDir;
         this.codec = codec;
         this.comparator = comparator;
-        this.maxRecordsInRam = maxRecordsInRam;
-        this.ramRecords = (T[])Array.newInstance(componentType, maxRecordsInRam);
+        this.maxRecordsInRam = maxRecordsInRam / 2;
+        this.ramRecordsOne = (T[])Array.newInstance(componentType, maxRecordsInRam);
+        this.ramRecordsTwo = (T[])Array.newInstance(componentType, maxRecordsInRam);
+        this.ramRecords = ramRecordsOne;
     }
 
     public void add(final T rec) {
@@ -191,6 +185,9 @@ public class SortingCollection<T> implements Iterable<T> {
             spillToDisk();
         }
 
+        service.shutdown();
+        while (!service.isTerminated()){}
+
         // Facilitate GC
         this.ramRecords = null;
     }
@@ -214,37 +211,77 @@ public class SortingCollection<T> implements Iterable<T> {
     /**
      * Sort the records in memory, write them to a file, and clear the buffer of records in memory.
      */
-    private void spillToDisk() {
-        try {
-            Arrays.sort(this.ramRecords, 0, this.numRecordsInRam, this.comparator);
-            final File f = newTempFile();
-            OutputStream os = null;
+
+    class SortAndWrite implements Runnable{
+
+        private int numRecordsInRam;
+        private T[] ramRecords;
+        private boolean isOnePart;
+
+        SortAndWrite(int numRcordsInRam, T[] ramRecords, boolean isOnePart){
+            this.numRecordsInRam = numRcordsInRam;
+            this.ramRecords = ramRecords;
+            this.isOnePart = isOnePart;
+        }
+
+        @Override
+        public void run() {
             try {
-                os = tempStreamFactory.wrapTempOutputStream(new FileOutputStream(f), Defaults.BUFFER_SIZE);
-                this.codec.setOutputStream(os);
-                for (int i = 0; i < this.numRecordsInRam; ++i) {
-                    this.codec.encode(ramRecords[i]);
-                    // Facilitate GC
-                    this.ramRecords[i] = null;
+                Arrays.sort(ramRecords, 0, numRecordsInRam, comparator);
+                final File f = newTempFile();
+                OutputStream os = null;
+                try {
+                    os = tempStreamFactory.wrapTempOutputStream(new FileOutputStream(f), Defaults.BUFFER_SIZE);
+                    codec.setOutputStream(os);
+                    for (int i = 0; i < numRecordsInRam; ++i) {
+                        codec.encode(ramRecords[i]);
+                        // Facilitate GC
+                       ramRecords[i] = null;
+                    }
+
+                    os.flush();
+                } catch (RuntimeIOException ex) {
+                    throw new RuntimeIOException("Problem writing temporary file " + f.getAbsolutePath() +
+                            ".  Try setting TMP_DIR to a file system with lots of space.", ex);
+                } finally {
+                    if (os != null) {
+                        os.close();
+                    }
                 }
 
-                os.flush();
-            } catch (RuntimeIOException ex) {
-                throw new RuntimeIOException("Problem writing temporary file " + f.getAbsolutePath() +
-                        ".  Try setting TMP_DIR to a file system with lots of space.", ex);
-            } finally {
-                if (os != null) {
-                    os.close();
-                }
+                files.add(f);
+
+            }
+            catch (IOException e) {
+                throw new RuntimeIOException(e);
             }
 
-            this.numRecordsInRam = 0;
-            this.files.add(f);
+            if (isOnePart) {
+                ramRecordsOneIsActive = false;
+            } else{
+                ramRecordsTwoIsActive = false;
+            }
+        }
+    }
 
+
+    private void spillToDisk() {
+        if (isWriteRamRecordsOne) {
+            Runnable task = new SortAndWrite(numRecordsInRam, ramRecordsOne, true);
+            service.execute(task);
+            while (ramRecordsTwoIsActive){}
+            ramRecordsTwoIsActive = true;
+            ramRecords = ramRecordsTwo;
+            isWriteRamRecordsOne = false;
+        } else {
+            Runnable task = new SortAndWrite(numRecordsInRam, ramRecordsTwo, false);
+            service.execute(task);
+            while (ramRecordsOneIsActive) {}
+            ramRecordsOneIsActive = true;
+            ramRecords = ramRecordsOne;
+            isWriteRamRecordsOne = true;
         }
-        catch (IOException e) {
-            throw new RuntimeIOException(e);
-        }
+        numRecordsInRam = 0;
     }
 
     /**
