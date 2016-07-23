@@ -494,20 +494,20 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                         " / " +
                         StringUtil.bytesToString(prs.read2, 0, MIN_IDENTICAL_BASES));
             } else {
-                final Map<String, List<PairedReadSequence>> sequencesByLibrary = splitByLibrary(group, readGroups);
 
                 // Now process the reads by library
 
                 class WorkWithLibrary implements Runnable {
 
-                    Map<String, List<PairedReadSequence>> sequencesByLibrary;
+                    List<PairedReadSequence> group;
 
-                    WorkWithLibrary (Map<String, List<PairedReadSequence>> sequencesByLibrary){
-                        this.sequencesByLibrary = sequencesByLibrary;
+                    WorkWithLibrary ( List<PairedReadSequence> group){
+                        this.group = group;
                     }
 
                     @Override
                     public void run() {
+                final Map<String, List<PairedReadSequence>> sequencesByLibrary = splitByLibrary(group, readGroups);
                         for (final Map.Entry<String, List<PairedReadSequence>> entry : sequencesByLibrary.entrySet()) {
                             final String library = entry.getKey();
                             final List<PairedReadSequence> seqs = entry.getValue();
@@ -555,7 +555,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                     }
                 }
 
-                service.execute(new WorkWithLibrary(sequencesByLibrary));
+                service.execute(new WorkWithLibrary(group));
 
                 ++groupsProcessed;
                 if (lastLogTime < System.currentTimeMillis() - 60000) {
