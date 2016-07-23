@@ -41,6 +41,8 @@ import picard.sam.util.PhysicalLocationShort;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static java.lang.Math.pow;
 
@@ -470,6 +472,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         log.info(String.format("Finished reading - read %d records - moving on to scanning for duplicates.", progress.getCount()));
 
         // Now go through the sorted reads and attempt to find duplicates
+        ExecutorService service = Executors.newSingleThreadExecutor();
         final PeekableIterator<PairedReadSequence> iterator = new PeekableIterator<PairedReadSequence>(sorter.iterator());
 
         final Map<String, Histogram<Integer>> duplicationHistosByLibrary = new HashMap<String, Histogram<Integer>>();
@@ -494,49 +497,65 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                 final Map<String, List<PairedReadSequence>> sequencesByLibrary = splitByLibrary(group, readGroups);
 
                 // Now process the reads by library
-                for (final Map.Entry<String, List<PairedReadSequence>> entry : sequencesByLibrary.entrySet()) {
-                    final String library = entry.getKey();
-                    final List<PairedReadSequence> seqs = entry.getValue();
 
-                    Histogram<Integer> duplicationHisto = duplicationHistosByLibrary.get(library);
-                    Histogram<Integer> opticalHisto = opticalHistosByLibrary.get(library);
-                    if (duplicationHisto == null) {
-                        duplicationHisto = new Histogram<Integer>("duplication_group_count", library);
-                        opticalHisto = new Histogram<Integer>("duplication_group_count", "optical_duplicates");
-                        duplicationHistosByLibrary.put(library, duplicationHisto);
-                        opticalHistosByLibrary.put(library, opticalHisto);
+                class WorkWithLibrary implements Runnable {
+
+                    Map<String, List<PairedReadSequence>> sequencesByLibrary;
+
+                    WorkWithLibrary (Map<String, List<PairedReadSequence>> sequencesByLibrary){
+                        this.sequencesByLibrary = sequencesByLibrary;
                     }
 
-                    // Figure out if any reads within this group are duplicates of one another
-                    for (int i = 0; i < seqs.size(); ++i) {
-                        final PairedReadSequence lhs = seqs.get(i);
-                        if (lhs == null) continue;
-                        final List<PairedReadSequence> dupes = new ArrayList<PairedReadSequence>();
+                    @Override
+                    public void run() {
+                        for (final Map.Entry<String, List<PairedReadSequence>> entry : sequencesByLibrary.entrySet()) {
+                            final String library = entry.getKey();
+                            final List<PairedReadSequence> seqs = entry.getValue();
 
-                        for (int j = i + 1; j < seqs.size(); ++j) {
-                            final PairedReadSequence rhs = seqs.get(j);
-                            if (rhs == null) continue;
+                            Histogram<Integer> duplicationHisto = duplicationHistosByLibrary.get(library);
+                            Histogram<Integer> opticalHisto = opticalHistosByLibrary.get(library);
+                            if (duplicationHisto == null) {
+                                duplicationHisto = new Histogram<Integer>("duplication_group_count", library);
+                                opticalHisto = new Histogram<Integer>("duplication_group_count", "optical_duplicates");
+                                duplicationHistosByLibrary.put(library, duplicationHisto);
+                                opticalHistosByLibrary.put(library, opticalHisto);
+                            }
 
-                            if (matches(lhs, rhs, MAX_DIFF_RATE, useBarcodes)) {
-                                dupes.add(rhs);
-                                seqs.set(j, null);
+                            // Figure out if any reads within this group are duplicates of one another
+                            for (int i = 0; i < seqs.size(); ++i) {
+                                final PairedReadSequence lhs = seqs.get(i);
+                                if (lhs == null) continue;
+                                final List<PairedReadSequence> dupes = new ArrayList<PairedReadSequence>();
+
+                                for (int j = i + 1; j < seqs.size(); ++j) {
+                                    final PairedReadSequence rhs = seqs.get(j);
+                                    if (rhs == null) continue;
+
+                                    if (matches(lhs, rhs, MAX_DIFF_RATE, useBarcodes)) {
+                                        dupes.add(rhs);
+                                        seqs.set(j, null);
+                                    }
+                                }
+
+                                if (!dupes.isEmpty()) {
+                                    dupes.add(lhs);
+                                    final int duplicateCount = dupes.size();
+                                    duplicationHisto.increment(duplicateCount);
+
+                                    final boolean[] flags = opticalDuplicateFinder.findOpticalDuplicates(dupes, lhs);
+                                    for (final boolean b : flags) {
+                                        if (b) opticalHisto.increment(duplicateCount);
+                                    }
+                                } else {
+                                    duplicationHisto.increment(1);
+                                }
                             }
                         }
 
-                        if (!dupes.isEmpty()) {
-                            dupes.add(lhs);
-                            final int duplicateCount = dupes.size();
-                            duplicationHisto.increment(duplicateCount);
-
-                            final boolean[] flags = opticalDuplicateFinder.findOpticalDuplicates(dupes, lhs);
-                            for (final boolean b : flags) {
-                                if (b) opticalHisto.increment(duplicateCount);
-                            }
-                        } else {
-                            duplicationHisto.increment(1);
-                        }
                     }
                 }
+
+                service.execute(new WorkWithLibrary(sequencesByLibrary));
 
                 ++groupsProcessed;
                 if (lastLogTime < System.currentTimeMillis() - 60000) {
@@ -545,6 +564,8 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                 }
             }
         }
+        service.shutdown();
+        while (!service.isTerminated()){}
 
         iterator.close();
         sorter.cleanup();
