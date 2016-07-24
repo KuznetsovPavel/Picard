@@ -177,10 +177,6 @@ public class SortingCollection<T> implements Iterable<T> {
 
         doneAdding = true;
 
-        if (this.files.isEmpty()) {
-            return;
-        }
-
         if (this.numRecordsInRam > 0) {
             spillToDisk();
         }
