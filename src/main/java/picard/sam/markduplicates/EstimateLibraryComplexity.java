@@ -41,6 +41,7 @@ import picard.sam.util.PhysicalLocationShort;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.Exchanger;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -412,10 +413,44 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         final ProgressLogger progress = new ProgressLogger(log, (int) 1e6, "Read");
         for (final File f : INPUT) {
             final Map<String, PairedReadSequence> pendingByName = new HashMap<String, PairedReadSequence>();
-            final SamReader in = SamReaderFactory.makeDefault().referenceSequence(REFERENCE_SEQUENCE).open(f);
-            readGroups.addAll(in.getFileHeader().getReadGroups());
+            Exchanger<SAMRecord> exchanger = new Exchanger<SAMRecord>();
 
-            for (final SAMRecord rec : in) {
+            class Reader implements Runnable {
+                Exchanger<SAMRecord> exchanger;
+                Reader (Exchanger<SAMRecord> exchanger) {
+                    this.exchanger = exchanger;
+                }
+                @Override
+                public void run() {
+                    final SamReader in = SamReaderFactory.makeDefault().referenceSequence(REFERENCE_SEQUENCE).open(f);
+                    readGroups.addAll(in.getFileHeader().getReadGroups());
+                    try {
+                        for (final SAMRecord rec : in) {
+                            exchanger.exchange(rec);
+                        }
+                        exchanger.exchange(null);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                        CloserUtil.close(in);
+                }
+            }
+
+            new Thread(new Reader(exchanger)).start();
+
+            while (true) {
+
+                SAMRecord rec = null;
+
+                try {
+                    rec = exchanger.exchange(null);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+
+                if (rec == null)
+                    break;
+
                 if (!rec.getReadPairedFlag()) continue;
                 if (!rec.getFirstOfPairFlag() && !rec.getSecondOfPairFlag()) {
                     continue;
@@ -465,8 +500,8 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                 }
 
                 progress.record(rec);
+
             }
-            CloserUtil.close(in);
         }
 
         log.info(String.format("Finished reading - read %d records - moving on to scanning for duplicates.", progress.getCount()));
