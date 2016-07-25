@@ -413,22 +413,26 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         final ProgressLogger progress = new ProgressLogger(log, (int) 1e6, "Read");
         for (final File f : INPUT) {
             final Map<String, PairedReadSequence> pendingByName = new HashMap<String, PairedReadSequence>();
-            Exchanger<SAMRecord> exchanger = new Exchanger<SAMRecord>();
+            Exchanger<Queue<SAMRecord>> exchanger = new Exchanger<Queue<SAMRecord>>();
 
             class Reader implements Runnable {
-                Exchanger<SAMRecord> exchanger;
-                Reader (Exchanger<SAMRecord> exchanger) {
+                Exchanger<Queue<SAMRecord>> exchanger;
+                Reader (Exchanger<Queue<SAMRecord>> exchanger) {
                     this.exchanger = exchanger;
                 }
                 @Override
                 public void run() {
                     final SamReader in = SamReaderFactory.makeDefault().referenceSequence(REFERENCE_SEQUENCE).open(f);
                     readGroups.addAll(in.getFileHeader().getReadGroups());
+                    Queue<SAMRecord> queue = new ArrayDeque<SAMRecord>(10);
                     try {
                         for (final SAMRecord rec : in) {
-                            exchanger.exchange(rec);
+                            queue.add(rec);
+                            if (queue.size() == 10) {
+                                queue = exchanger.exchange(queue);
+                            }
                         }
-                        exchanger.exchange(null);
+                        exchanger.exchange(queue);
                     } catch (InterruptedException e) {
                         e.printStackTrace();
                     }
@@ -438,68 +442,85 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
 
             new Thread(new Reader(exchanger)).start();
 
+            Queue<SAMRecord> queue = new ArrayDeque<SAMRecord>(10);
+
             while (true) {
 
-                SAMRecord rec = null;
+                SAMRecord rec;
+
+                int i = 0;
 
                 try {
-                    rec = exchanger.exchange(null);
+                    queue = exchanger.exchange(queue);
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
 
-                if (rec == null)
+                if (queue.size() == 0) {
                     break;
-
-                if (!rec.getReadPairedFlag()) continue;
-                if (!rec.getFirstOfPairFlag() && !rec.getSecondOfPairFlag()) {
-                    continue;
                 }
-                if (rec.isSecondaryOrSupplementary()) continue;
 
-                PairedReadSequence prs = pendingByName.remove(rec.getReadName());
-                if (prs == null) {
-                    // Make a new paired read object and add RG and physical location information to it
-                    prs = useBarcodes ? new PairedReadSequenceWithBarcodes() : new PairedReadSequence();
-                    if (opticalDuplicateFinder.addLocationInformation(rec.getReadName(), prs)) {
-                        final SAMReadGroupRecord rg = rec.getReadGroup();
-                        if (rg != null) prs.setReadGroup((short) readGroups.indexOf(rg));
+                while (!queue.isEmpty()) {
+
+                    rec = queue.remove();
+
+                    i++;
+
+                    if (!rec.getReadPairedFlag()) continue;
+                    if (!rec.getFirstOfPairFlag() && !rec.getSecondOfPairFlag()) {
+                        continue;
+                    }
+                    if (rec.isSecondaryOrSupplementary()) continue;
+
+                    PairedReadSequence prs = pendingByName.remove(rec.getReadName());
+                    if (prs == null) {
+                        // Make a new paired read object and add RG and physical location information to it
+                        prs = useBarcodes ? new PairedReadSequenceWithBarcodes() : new PairedReadSequence();
+                        if (opticalDuplicateFinder.addLocationInformation(rec.getReadName(), prs)) {
+                            final SAMReadGroupRecord rg = rec.getReadGroup();
+                            if (rg != null) prs.setReadGroup((short) readGroups.indexOf(rg));
+                        }
+
+                        pendingByName.put(rec.getReadName(), prs);
                     }
 
-                    pendingByName.put(rec.getReadName(), prs);
-                }
+                    // Read passes quality check if both ends meet the mean quality criteria
+                    final boolean passesQualityCheck = passesQualityCheck(rec.getReadBases(),
+                            rec.getBaseQualities(),
+                            MIN_IDENTICAL_BASES,
+                            MIN_MEAN_QUALITY);
+                    prs.qualityOk = prs.qualityOk && passesQualityCheck;
 
-                // Read passes quality check if both ends meet the mean quality criteria
-                final boolean passesQualityCheck = passesQualityCheck(rec.getReadBases(),
-                        rec.getBaseQualities(),
-                        MIN_IDENTICAL_BASES,
-                        MIN_MEAN_QUALITY);
-                prs.qualityOk = prs.qualityOk && passesQualityCheck;
+                    // Get the bases and restore them to their original orientation if necessary
+                    final byte[] bases = rec.getReadBases();
+                    if (rec.getReadNegativeStrandFlag()) SequenceUtil.reverseComplement(bases);
 
-                // Get the bases and restore them to their original orientation if necessary
-                final byte[] bases = rec.getReadBases();
-                if (rec.getReadNegativeStrandFlag()) SequenceUtil.reverseComplement(bases);
+                    final PairedReadSequenceWithBarcodes prsWithBarcodes = (useBarcodes) ? (PairedReadSequenceWithBarcodes) prs : null;
 
-                final PairedReadSequenceWithBarcodes prsWithBarcodes = (useBarcodes) ? (PairedReadSequenceWithBarcodes) prs : null;
-
-                if (rec.getFirstOfPairFlag()) {
-                    prs.read1 = bases;
-                    if (useBarcodes) {
-                        prsWithBarcodes.barcode = getBarcodeValue(rec);
-                        prsWithBarcodes.readOneBarcode = getReadOneBarcodeValue(rec);
+                    if (rec.getFirstOfPairFlag()) {
+                        prs.read1 = bases;
+                        if (useBarcodes) {
+                            prsWithBarcodes.barcode = getBarcodeValue(rec);
+                            prsWithBarcodes.readOneBarcode = getReadOneBarcodeValue(rec);
+                        }
+                    } else {
+                        prs.read2 = bases;
+                        if (useBarcodes) {
+                            prsWithBarcodes.readTwoBarcode = getReadTwoBarcodeValue(rec);
+                        }
                     }
-                } else {
-                    prs.read2 = bases;
-                    if (useBarcodes) {
-                        prsWithBarcodes.readTwoBarcode = getReadTwoBarcodeValue(rec);
+
+                    if (prs.read1 != null && prs.read2 != null && prs.qualityOk) {
+                        sorter.add(prs);
                     }
+
+                    progress.record(rec);
                 }
 
-                if (prs.read1 != null && prs.read2 != null && prs.qualityOk) {
-                    sorter.add(prs);
-                }
-
-                progress.record(rec);
+                if (i == 10)
+                    i = 0;
+                else
+                    break;
 
             }
         }
