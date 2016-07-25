@@ -417,18 +417,20 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
 
             class Reader implements Runnable {
                 Exchanger<Queue<SAMRecord>> exchanger;
-                Reader (Exchanger<Queue<SAMRecord>> exchanger) {
+                int capacity;
+                Reader (Exchanger<Queue<SAMRecord>> exchanger, int capacity) {
                     this.exchanger = exchanger;
+                    this.capacity = capacity;
                 }
                 @Override
                 public void run() {
                     final SamReader in = SamReaderFactory.makeDefault().referenceSequence(REFERENCE_SEQUENCE).open(f);
                     readGroups.addAll(in.getFileHeader().getReadGroups());
-                    Queue<SAMRecord> queue = new ArrayDeque<SAMRecord>(10);
+                    Queue<SAMRecord> queue = new ArrayDeque<SAMRecord>(capacity);
                     try {
                         for (final SAMRecord rec : in) {
                             queue.add(rec);
-                            if (queue.size() == 10) {
+                            if (queue.size() == capacity) {
                                 queue = exchanger.exchange(queue);
                             }
                         }
@@ -440,9 +442,11 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                 }
             }
 
-            new Thread(new Reader(exchanger)).start();
+            int capacity = 100;
 
-            Queue<SAMRecord> queue = new ArrayDeque<SAMRecord>(10);
+            new Thread(new Reader(exchanger, capacity)).start();
+
+            Queue<SAMRecord> queue = new ArrayDeque<SAMRecord>(capacity);
 
             while (true) {
 
@@ -517,7 +521,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                     progress.record(rec);
                 }
 
-                if (i == 10)
+                if (i == capacity)
                     i = 0;
                 else
                     break;
