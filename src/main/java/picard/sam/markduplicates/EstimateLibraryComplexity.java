@@ -442,7 +442,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                 }
             }
 
-            int capacity = 100;
+            int capacity = 1000;
 
             new Thread(new Reader(exchanger, capacity)).start();
 
