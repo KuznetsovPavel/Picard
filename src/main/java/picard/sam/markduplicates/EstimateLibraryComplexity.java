@@ -41,6 +41,7 @@ import picard.sam.util.PhysicalLocationShort;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.Exchanger;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -412,61 +413,120 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         final ProgressLogger progress = new ProgressLogger(log, (int) 1e6, "Read");
         for (final File f : INPUT) {
             final Map<String, PairedReadSequence> pendingByName = new HashMap<String, PairedReadSequence>();
-            final SamReader in = SamReaderFactory.makeDefault().referenceSequence(REFERENCE_SEQUENCE).open(f);
-            readGroups.addAll(in.getFileHeader().getReadGroups());
+            Exchanger<Queue<SAMRecord>> exchanger = new Exchanger<Queue<SAMRecord>>();
 
-            for (final SAMRecord rec : in) {
-                if (!rec.getReadPairedFlag()) continue;
-                if (!rec.getFirstOfPairFlag() && !rec.getSecondOfPairFlag()) {
-                    continue;
+            class Reader implements Runnable {
+                Exchanger<Queue<SAMRecord>> exchanger;
+                int capacity;
+                Reader (Exchanger<Queue<SAMRecord>> exchanger, int capacity) {
+                    this.exchanger = exchanger;
+                    this.capacity = capacity;
                 }
-                if (rec.isSecondaryOrSupplementary()) continue;
-
-                PairedReadSequence prs = pendingByName.remove(rec.getReadName());
-                if (prs == null) {
-                    // Make a new paired read object and add RG and physical location information to it
-                    prs = useBarcodes ? new PairedReadSequenceWithBarcodes() : new PairedReadSequence();
-                    if (opticalDuplicateFinder.addLocationInformation(rec.getReadName(), prs)) {
-                        final SAMReadGroupRecord rg = rec.getReadGroup();
-                        if (rg != null) prs.setReadGroup((short) readGroups.indexOf(rg));
+                @Override
+                public void run() {
+                    final SamReader in = SamReaderFactory.makeDefault().referenceSequence(REFERENCE_SEQUENCE).open(f);
+                    readGroups.addAll(in.getFileHeader().getReadGroups());
+                    Queue<SAMRecord> queue = new ArrayDeque<SAMRecord>(capacity);
+                    try {
+                        for (final SAMRecord rec : in) {
+                            queue.add(rec);
+                            if (queue.size() == capacity) {
+                                queue = exchanger.exchange(queue);
+                            }
+                        }
+                        exchanger.exchange(queue);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
                     }
-
-                    pendingByName.put(rec.getReadName(), prs);
+                        CloserUtil.close(in);
                 }
-
-                // Read passes quality check if both ends meet the mean quality criteria
-                final boolean passesQualityCheck = passesQualityCheck(rec.getReadBases(),
-                        rec.getBaseQualities(),
-                        MIN_IDENTICAL_BASES,
-                        MIN_MEAN_QUALITY);
-                prs.qualityOk = prs.qualityOk && passesQualityCheck;
-
-                // Get the bases and restore them to their original orientation if necessary
-                final byte[] bases = rec.getReadBases();
-                if (rec.getReadNegativeStrandFlag()) SequenceUtil.reverseComplement(bases);
-
-                final PairedReadSequenceWithBarcodes prsWithBarcodes = (useBarcodes) ? (PairedReadSequenceWithBarcodes) prs : null;
-
-                if (rec.getFirstOfPairFlag()) {
-                    prs.read1 = bases;
-                    if (useBarcodes) {
-                        prsWithBarcodes.barcode = getBarcodeValue(rec);
-                        prsWithBarcodes.readOneBarcode = getReadOneBarcodeValue(rec);
-                    }
-                } else {
-                    prs.read2 = bases;
-                    if (useBarcodes) {
-                        prsWithBarcodes.readTwoBarcode = getReadTwoBarcodeValue(rec);
-                    }
-                }
-
-                if (prs.read1 != null && prs.read2 != null && prs.qualityOk) {
-                    sorter.add(prs);
-                }
-
-                progress.record(rec);
             }
-            CloserUtil.close(in);
+
+            int capacity = 1000;
+
+            new Thread(new Reader(exchanger, capacity)).start();
+
+            Queue<SAMRecord> queue = new ArrayDeque<SAMRecord>(capacity);
+
+            while (true) {
+
+                SAMRecord rec;
+
+                int i = 0;
+
+                try {
+                    queue = exchanger.exchange(queue);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+
+                if (queue.size() == 0) {
+                    break;
+                }
+
+                while (!queue.isEmpty()) {
+
+                    rec = queue.remove();
+
+                    i++;
+
+                    if (!rec.getReadPairedFlag()) continue;
+                    if (!rec.getFirstOfPairFlag() && !rec.getSecondOfPairFlag()) {
+                        continue;
+                    }
+                    if (rec.isSecondaryOrSupplementary()) continue;
+
+                    PairedReadSequence prs = pendingByName.remove(rec.getReadName());
+                    if (prs == null) {
+                        // Make a new paired read object and add RG and physical location information to it
+                        prs = useBarcodes ? new PairedReadSequenceWithBarcodes() : new PairedReadSequence();
+                        if (opticalDuplicateFinder.addLocationInformation(rec.getReadName(), prs)) {
+                            final SAMReadGroupRecord rg = rec.getReadGroup();
+                            if (rg != null) prs.setReadGroup((short) readGroups.indexOf(rg));
+                        }
+
+                        pendingByName.put(rec.getReadName(), prs);
+                    }
+
+                    // Read passes quality check if both ends meet the mean quality criteria
+                    final boolean passesQualityCheck = passesQualityCheck(rec.getReadBases(),
+                            rec.getBaseQualities(),
+                            MIN_IDENTICAL_BASES,
+                            MIN_MEAN_QUALITY);
+                    prs.qualityOk = prs.qualityOk && passesQualityCheck;
+
+                    // Get the bases and restore them to their original orientation if necessary
+                    final byte[] bases = rec.getReadBases();
+                    if (rec.getReadNegativeStrandFlag()) SequenceUtil.reverseComplement(bases);
+
+                    final PairedReadSequenceWithBarcodes prsWithBarcodes = (useBarcodes) ? (PairedReadSequenceWithBarcodes) prs : null;
+
+                    if (rec.getFirstOfPairFlag()) {
+                        prs.read1 = bases;
+                        if (useBarcodes) {
+                            prsWithBarcodes.barcode = getBarcodeValue(rec);
+                            prsWithBarcodes.readOneBarcode = getReadOneBarcodeValue(rec);
+                        }
+                    } else {
+                        prs.read2 = bases;
+                        if (useBarcodes) {
+                            prsWithBarcodes.readTwoBarcode = getReadTwoBarcodeValue(rec);
+                        }
+                    }
+
+                    if (prs.read1 != null && prs.read2 != null && prs.qualityOk) {
+                        sorter.add(prs);
+                    }
+
+                    progress.record(rec);
+                }
+
+                if (i == capacity)
+                    i = 0;
+                else
+                    break;
+
+            }
         }
 
         log.info(String.format("Finished reading - read %d records - moving on to scanning for duplicates.", progress.getCount()));
